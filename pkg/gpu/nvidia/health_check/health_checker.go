@@ -23,8 +23,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/compute/metadata"
-	"github.com/GoogleCloudPlatform/container-engine-accelerators/pkg/gpu/nvidia/util"
-	"github.com/NVIDIA/gpu-monitoring-tools/bindings/go/nvml"
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/golang/glog"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -177,26 +176,27 @@ func (hc *GPUHealthChecker) Start() error {
 		glog.Infof("Healthchecker receives device %s, device %v+", name, device)
 	}
 
-	// Building mapping between device ID and their nvml represetation
-	count, err := nvml.GetDeviceCount()
-	if err != nil {
-		return fmt.Errorf("failed to get device count: %s", err)
+	// Building mapping between device ID and their nvml representation
+	count, ret := nvml.DeviceGetCount()
+	if ret != nvml.SUCCESS {
+		return fmt.Errorf("failed to get device count: %s", nvml.ErrorString(ret))
 	}
 
 	glog.Infof("Found %d GPU devices", count)
-	for i := uint(0); i < count; i++ {
-		device, err := nvml.NewDeviceLite(i)
-		if err != nil {
-			return fmt.Errorf("failed to read device with index %d: %v", i, err)
+	for i := 0; i < count; i++ {
+		device, ret := nvml.DeviceGetHandleByIndex(i)
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("failed to read device with index %d: %v", i, nvml.ErrorString(ret))
 		}
 
-		deviceName, err := util.DeviceNameFromPath(device.Path)
-		if err != nil {
-			glog.Errorf("Invalid GPU device path found: %s. Skipping this device", device.Path)
+		minor, ret := device.GetMinorNumber()
+		if ret != nvml.SUCCESS {
+			glog.Errorf("Invalid GPU device minor number found for index %d: %v. Skipping this device", i, nvml.ErrorString(ret))
 			continue
 		}
+		deviceName := fmt.Sprintf("nvidia%d", minor)
 
-		migEnabled, err := device.IsMigEnabled()
+		migEnabled, err := isMigEnabled(device)
 		if err != nil {
 			glog.Errorf("Error checking if MIG is enabled on device %s. Skipping this device. Error: %v", deviceName, err)
 			continue
@@ -212,22 +212,33 @@ func (hc *GPUHealthChecker) Start() error {
 		}
 	}
 
-	hc.eventSet = nvml.NewEventSet()
-	for _, d := range hc.nvmlDevices {
-		gpu, _, _, err := nvml.ParseMigDeviceUUID(d.UUID)
+	eventSet, ret := nvml.EventSetCreate()
+	if ret != nvml.SUCCESS {
+		return fmt.Errorf("failed to create NVML eventSet: %v", nvml.ErrorString(ret))
+	}
+	hc.eventSet = eventSet
+	for name, d := range hc.nvmlDevices {
+		uuid, ret := d.GetUUID()
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("failed to get UUID for device %s: %v", name, nvml.ErrorString(ret))
+		}
+		gpu, _, _, err := parseMigDeviceUUID(uuid)
 		if err != nil {
-			gpu = d.UUID
+			gpu = uuid
 		}
 
-		glog.Infof("Registering device %v. UUID: %s", d.Path, d.UUID)
-		err = nvml.RegisterEventForDevice(hc.eventSet, nvml.XidCriticalError, gpu)
-		if err != nil {
-			if strings.HasSuffix(err.Error(), "Not Supported") {
-				glog.Warningf("Warning: %s is too old to support healthchecking: %v. It will always be marked healthy.", d.Path, err)
-				continue
-			} else {
-				return fmt.Errorf("failed to register device %s for NVML eventSet: %v", d.Path, err)
-			}
+		glog.Infof("Registering device %s. UUID: %s", name, uuid)
+		gpuDevice, ret := nvml.DeviceGetHandleByUUID(gpu)
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("failed to get device handle from UUID %s: %v", gpu, nvml.ErrorString(ret))
+		}
+		ret = gpuDevice.RegisterEvents(nvml.EventTypeXidCriticalError, hc.eventSet)
+		if ret == nvml.ERROR_NOT_SUPPORTED {
+			glog.Warningf("Warning: %s is too old to support healthchecking: %v. It will always be marked healthy.", name, nvml.ErrorString(ret))
+			continue
+		}
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("failed to register device %s for NVML eventSet: %v", name, nvml.ErrorString(ret))
 		}
 	}
 
@@ -240,28 +251,55 @@ func (hc *GPUHealthChecker) Start() error {
 	return nil
 }
 
-func (hc *GPUHealthChecker) addDevice(deviceName string, device *nvml.Device) {
+func isMigEnabled(device nvml.Device) (bool, error) {
+	cm, pm, ret := device.GetMigMode()
+	if ret == nvml.ERROR_NOT_SUPPORTED {
+		return false, nil
+	}
+	if ret != nvml.SUCCESS {
+		return false, fmt.Errorf("failed to get MIG mode: %v", nvml.ErrorString(ret))
+	}
+	return (cm == nvml.DEVICE_MIG_ENABLE) && (cm == pm), nil
+}
+
+func (hc *GPUHealthChecker) addDevice(deviceName string, device nvml.Device) {
 	if _, ok := hc.devices[deviceName]; !ok {
 		// Only monitor the devices passed in
 		glog.Warningf("Ignoring device %s for health check.", deviceName)
 		return
 	}
-	glog.Infof("Found non-mig device %s for health monitoring. UUID: %s", deviceName, device.UUID)
-	hc.nvmlDevices[deviceName] = device
+	uuid, ret := device.GetUUID()
+	if ret != nvml.SUCCESS {
+		glog.Errorf("Failed to get UUID for device %s: %v. Skipping this device.", deviceName, nvml.ErrorString(ret))
+		return
+	}
+	glog.Infof("Found non-mig device %s for health monitoring. UUID: %s", deviceName, uuid)
+	hc.nvmlDevices[deviceName] = &device
 }
 
-func (hc *GPUHealthChecker) addMigEnabledDevice(deviceName string, device *nvml.Device) error {
+func (hc *GPUHealthChecker) addMigEnabledDevice(deviceName string, device nvml.Device) error {
 	glog.Infof("HealthChecker detects MIG is enabled on device %s", deviceName)
 
-	migs, err := device.GetMigDevices()
-	if err != nil {
-		return fmt.Errorf("error getting MIG devices on device %s. err: %v.", deviceName, err)
+	maxMigDevices, ret := device.GetMaxMigDeviceCount()
+	if ret != nvml.SUCCESS {
+		return fmt.Errorf("error getting max MIG device count on device %s. err: %v", deviceName, nvml.ErrorString(ret))
 	}
 
-	for _, mig := range migs {
-		gpu, gi, _, err := nvml.ParseMigDeviceUUID(mig.UUID)
+	for i := 0; i < maxMigDevices; i++ {
+		mig, ret := device.GetMigDeviceHandleByIndex(i)
+		if ret == nvml.ERROR_NOT_FOUND {
+			continue
+		}
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("error getting MIG device handle at index %d on device %s. err: %v", i, deviceName, nvml.ErrorString(ret))
+		}
+		migUUID, ret := mig.GetUUID()
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("error getting MIG UUID at index %d on device %s. err: %v", i, deviceName, nvml.ErrorString(ret))
+		}
+		gpu, gi, _, err := parseMigDeviceUUID(migUUID)
 		if err != nil {
-			return fmt.Errorf("error parsing MIG UUID on device %s, MIG UUID: %s, error %v", gpu, mig.UUID, err)
+			return fmt.Errorf("error parsing MIG UUID on device %s, MIG UUID: %s, error %v", gpu, migUUID, err)
 		}
 		migDeviceName := fmt.Sprintf("%s/gi%d", deviceName, gi)
 
@@ -270,23 +308,100 @@ func (hc *GPUHealthChecker) addMigEnabledDevice(deviceName string, device *nvml.
 			glog.Warningf("Ignoring device %s for health check.", migDeviceName)
 			continue
 		}
-		glog.Infof("Found mig device %s for health monitoring. UUID: %s", migDeviceName, mig.UUID)
-		hc.nvmlDevices[migDeviceName] = mig
+		glog.Infof("Found mig device %s for health monitoring. UUID: %s", migDeviceName, migUUID)
+		hc.nvmlDevices[migDeviceName] = &mig
 	}
 	return nil
 }
 
+func parseMigDeviceUUID(uuid string) (string, uint32, uint32, error) {
+	migDevice, ret := nvml.DeviceGetHandleByUUID(uuid)
+	if ret == nvml.SUCCESS {
+		return getMIGDeviceInfo(migDevice)
+	}
+	return parseMigDeviceUUIDString(uuid)
+}
+
+func getMIGDeviceInfo(migDevice nvml.Device) (string, uint32, uint32, error) {
+	parentDevice, ret := migDevice.GetDeviceHandleFromMigDeviceHandle()
+	if ret != nvml.SUCCESS {
+		return "", 0, 0, fmt.Errorf("nvml: %v", nvml.ErrorString(ret))
+	}
+
+	parentUUID, ret := parentDevice.GetUUID()
+	if ret != nvml.SUCCESS {
+		return "", 0, 0, fmt.Errorf("nvml: %v", nvml.ErrorString(ret))
+	}
+
+	gi, ret := migDevice.GetGpuInstanceId()
+	if ret != nvml.SUCCESS {
+		return "", 0, 0, fmt.Errorf("nvml: %v", nvml.ErrorString(ret))
+	}
+
+	ci, ret := migDevice.GetComputeInstanceId()
+	if ret != nvml.SUCCESS {
+		return "", 0, 0, fmt.Errorf("nvml: %v", nvml.ErrorString(ret))
+	}
+
+	return parentUUID, uint32(gi), uint32(ci), nil
+}
+
+func parseMigDeviceUUIDString(mig string) (string, uint32, uint32, error) {
+	tokens := strings.SplitN(mig, "-", 2)
+	if len(tokens) != 2 || tokens[0] != "MIG" {
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
+	}
+
+	tokens = strings.SplitN(tokens[1], "/", 3)
+	if len(tokens) != 3 || !strings.HasPrefix(tokens[0], "GPU-") {
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
+	}
+
+	gi, err := strconv.Atoi(tokens[1])
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
+	}
+
+	ci, err := strconv.Atoi(tokens[2])
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("unable to parse UUID as MIG device")
+	}
+
+	return tokens[0], uint32(gi), uint32(ci), nil
+}
+
 type callDevice interface {
-	parseMigDeviceUUID(UUID string) (string, uint, uint, error)
+	parseMigDeviceUUID(UUID string) (string, uint32, uint32, error)
+	getDeviceUUID(deviceName string, device *nvml.Device) (string, error)
+	getEventDeviceUUID(e nvml.EventData) (string, error)
 }
 type GPUDevice struct{}
 
-func (gd *GPUDevice) parseMigDeviceUUID(UUID string) (string, uint, uint, error) {
-	return nvml.ParseMigDeviceUUID(UUID)
+func (gd *GPUDevice) parseMigDeviceUUID(UUID string) (string, uint32, uint32, error) {
+	return parseMigDeviceUUID(UUID)
 }
 
-func (hc *GPUHealthChecker) monitorXidevent(e nvml.Event) {
-	if _, ok := hc.monitorCriticalXid[e.Edata]; ok {
+func (gd *GPUDevice) getDeviceUUID(deviceName string, device *nvml.Device) (string, error) {
+	if device == nil {
+		return "", fmt.Errorf("nvml device %s is nil", deviceName)
+	}
+	uuid, ret := device.GetUUID()
+	if ret != nvml.SUCCESS {
+		return "", fmt.Errorf("failed to get UUID for device %s: %v", deviceName, nvml.ErrorString(ret))
+	}
+	return uuid, nil
+}
+
+func (gd *GPUDevice) getEventDeviceUUID(e nvml.EventData) (string, error) {
+	uuid, ret := e.Device.GetUUID()
+	if ret != nvml.SUCCESS {
+		return "", fmt.Errorf("failed to get UUID for event device: %v", nvml.ErrorString(ret))
+	}
+	return uuid, nil
+}
+
+func (hc *GPUHealthChecker) monitorXidevent(e nvml.EventData) {
+	if _, ok := hc.monitorCriticalXid[e.EventData]; ok {
 		glog.Info("Monitoring XID event")
 		// Set XID condition
 		node, err := hc.kubeClient.CoreV1().Nodes().Get(context.Background(), hc.nodeName, metav1.GetOptions{})
@@ -305,9 +420,9 @@ func (hc *GPUHealthChecker) monitorXidevent(e nvml.Event) {
 					glog.Errorf("Can't decode the value of condition.Reason %s", condition.Reason)
 					return
 				}
-				xidStr := strconv.FormatUint(e.Edata, 10)
+				xidStr := strconv.FormatUint(e.EventData, 10)
 				if _, ok := genericMap[xidStr]; ok {
-					glog.Infof("XIDCritialError Condition already includes this XID %v, skip", e.Edata)
+					glog.Infof("XIDCritialError Condition already includes this XID %v, skip", e.EventData)
 					return
 				}
 				genericMap[xidStr] = true
@@ -320,8 +435,8 @@ func (hc *GPUHealthChecker) monitorXidevent(e nvml.Event) {
 			}
 		}
 		if !conditionFound {
-			glog.Infof("XIDCritialError Condition not exists, adding:", e.Edata)
-			genericMap := map[string]interface{}{strconv.FormatUint(e.Edata, 10): true}
+			glog.Infof("XIDCritialError Condition not exists, adding:", e.EventData)
+			genericMap := map[string]interface{}{strconv.FormatUint(e.EventData, 10): true}
 			jsonStr, err := json.Marshal(genericMap)
 			if err != nil {
 				glog.Errorf("Can't encode the value of genericMap: %s", genericMap)
@@ -383,16 +498,17 @@ func (hc *GPUHealthChecker) updateLastHeartbeatTime() {
 	}
 }
 
-func (hc *GPUHealthChecker) recordXIDEvent(e nvml.Event, cd callDevice) error {
+func (hc *GPUHealthChecker) recordXIDEvent(e nvml.EventData, cd callDevice) error {
 	node, err := hc.kubeClient.CoreV1().Nodes().Get(context.Background(), hc.nodeName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Caught XID error, XID=%d", e.Edata)
+	fmt.Fprintf(&sb, "Caught XID error, XID=%d", e.EventData)
 
-	if e.UUID != nil && len(*e.UUID) > 0 {
+	eventUUID, err := cd.getEventDeviceUUID(e)
+	if err == nil && len(eventUUID) > 0 {
 		var affectedGpuIDs []string
 		var affectedGpuUUIDs []string
 
@@ -401,7 +517,11 @@ func (hc *GPUHealthChecker) recordXIDEvent(e nvml.Event, cd callDevice) error {
 			if !ok || nvmlDev == nil {
 				continue
 			}
-			uuid := nvmlDev.UUID
+			uuid, err := cd.getDeviceUUID(d.ID, nvmlDev)
+			if err != nil {
+				glog.Errorf("Failed to get UUID for device %s: %v", d.ID, err)
+				continue
+			}
 			gpu, gi, ci, err := cd.parseMigDeviceUUID(uuid)
 			if err != nil {
 				gpu = uuid
@@ -409,8 +529,7 @@ func (hc *GPUHealthChecker) recordXIDEvent(e nvml.Event, cd callDevice) error {
 				ci = 0xFFFFFFFF
 			}
 
-			if e.GpuInstanceId != nil && e.ComputeInstanceId != nil &&
-				gpu == *e.UUID && gi == *e.GpuInstanceId && ci == *e.ComputeInstanceId {
+			if gpu == eventUUID && gi == e.GpuInstanceId && ci == e.ComputeInstanceId {
 				affectedGpuIDs = append(affectedGpuIDs, d.ID)
 				affectedGpuUUIDs = append(affectedGpuUUIDs, uuid)
 			}
@@ -420,7 +539,7 @@ func (hc *GPUHealthChecker) recordXIDEvent(e nvml.Event, cd callDevice) error {
 			fmt.Fprintf(&sb, ", GPU UUID=%s", strings.Join(affectedGpuUUIDs, ", "))
 			fmt.Fprintf(&sb, ", Device ID=%s", strings.Join(affectedGpuIDs, ", "))
 		} else {
-			fmt.Fprintf(&sb, ", GPU UUID=%s", *e.UUID)
+			fmt.Fprintf(&sb, ", GPU UUID=%s", eventUUID)
 		}
 	}
 
@@ -429,29 +548,30 @@ func (hc *GPUHealthChecker) recordXIDEvent(e nvml.Event, cd callDevice) error {
 	return nil
 }
 
-func (hc *GPUHealthChecker) catchError(e nvml.Event, cd callDevice) {
+func (hc *GPUHealthChecker) catchError(e nvml.EventData, cd callDevice) {
 	// Skip the error if it's not Xid critical
-	if e.Etype != nvml.XidCriticalError {
-		glog.Infof("Skip error Xid=%d as it is not Xid Critical", e.Edata)
+	if e.EventType != nvml.EventTypeXidCriticalError {
+		glog.Infof("Skip error Xid=%d as it is not Xid Critical", e.EventData)
 		return
 	}
 
 	err := hc.recordXIDEvent(e, cd)
 	if err != nil {
-		glog.Errorf("Failed to record XID=%d for node %s with err %v", e.Edata, hc.nodeName, err)
+		glog.Errorf("Failed to record XID=%d for node %s with err %v", e.EventData, hc.nodeName, err)
 	}
 	hc.monitorXidevent(e)
 
 	// Only marking device unhealthy on Double Bit ECC Error or customer-configured codes
 	// See https://docs.nvidia.com/deploy/xid-errors/index.html#topic_4
-	if _, ok := hc.healthCriticalXid[e.Edata]; !ok {
-		glog.Infof("Health checker is skipping Xid %v error", e.Edata)
+	if _, ok := hc.healthCriticalXid[e.EventData]; !ok {
+		glog.Infof("Health checker is skipping Xid %v error", e.EventData)
 		return
 	}
 
-	if e.UUID == nil || len(*e.UUID) == 0 {
+	eventUUID, err := cd.getEventDeviceUUID(e)
+	if err != nil || len(eventUUID) == 0 {
 		// All devices are unhealthy
-		glog.Errorf("XidCriticalError: Xid=%d, All devices will go unhealthy.", e.Edata)
+		glog.Errorf("XidCriticalError: Xid=%d, All devices will go unhealthy.", e.EventData)
 		for id, d := range hc.devices {
 			d.Health = pluginapi.Unhealthy
 			hc.devices[id] = d
@@ -462,9 +582,17 @@ func (hc *GPUHealthChecker) catchError(e nvml.Event, cd callDevice) {
 
 	founderrordevice := false
 	for _, d := range hc.devices {
-		// Please see https://github.com/NVIDIA/gpu-monitoring-tools/blob/148415f505c96052cb3b7fdf443b34ac853139ec/bindings/go/nvml/nvml.h#L1424
+		// Please see https://github.com/NVIDIA/go-nvml/blob/main/pkg/nvml/nvml.h
 		// for the rationale why gi and ci can be set as such when the UUID is a full GPU UUID and not a MIG device UUID.
-		uuid := hc.nvmlDevices[d.ID].UUID
+		nvmlDev, ok := hc.nvmlDevices[d.ID]
+		if !ok || nvmlDev == nil {
+			continue
+		}
+		uuid, err := cd.getDeviceUUID(d.ID, nvmlDev)
+		if err != nil {
+			glog.Errorf("Failed to get UUID for device %s: %v", d.ID, err)
+			continue
+		}
 		gpu, gi, ci, err := cd.parseMigDeviceUUID(uuid)
 		if err != nil {
 			gpu = uuid
@@ -472,8 +600,8 @@ func (hc *GPUHealthChecker) catchError(e nvml.Event, cd callDevice) {
 			ci = 0xFFFFFFFF
 		}
 
-		if gpu == *e.UUID && gi == *e.GpuInstanceId && ci == *e.ComputeInstanceId {
-			glog.Errorf("XidCriticalError: Xid=%d on Device=%s, uuid=%s, the device will go unhealthy.", e.Edata, d.ID, uuid)
+		if gpu == eventUUID && gi == e.GpuInstanceId && ci == e.ComputeInstanceId {
+			glog.Errorf("XidCriticalError: Xid=%d on Device=%s, uuid=%s, the device will go unhealthy.", e.EventData, d.ID, uuid)
 			d.Health = pluginapi.Unhealthy
 			hc.devices[d.ID] = d
 			hc.health <- d
@@ -481,7 +609,7 @@ func (hc *GPUHealthChecker) catchError(e nvml.Event, cd callDevice) {
 		}
 	}
 	if !founderrordevice {
-		glog.Errorf("XidCriticalError: Xid=%d on unknown device.", e.Edata)
+		glog.Errorf("XidCriticalError: Xid=%d on unknown device.", e.EventData)
 	}
 }
 
@@ -495,8 +623,8 @@ func (hc *GPUHealthChecker) listenToEvents() error {
 		default:
 		}
 
-		e, err := nvml.WaitForEvent(hc.eventSet, 5000)
-		if err != nil {
+		e, ret := hc.eventSet.Wait(5000)
+		if ret != nvml.SUCCESS {
 			continue
 		}
 		gd := GPUDevice{}
@@ -507,7 +635,7 @@ func (hc *GPUHealthChecker) listenToEvents() error {
 // Stop deletes the NVML events and stops the listening go routine
 func (hc *GPUHealthChecker) Stop() {
 	hc.recorder.(record.EventBroadcaster).Shutdown()
-	nvml.DeleteEventSet(hc.eventSet)
+	hc.eventSet.Free()
 	hc.stop <- true
 	<-hc.stop
 }
