@@ -5,7 +5,6 @@ go 1.25.8
 require (
 	cloud.google.com/go/compute/metadata v0.9.0
 	github.com/NVIDIA/go-nvml v0.12.0-2
-	github.com/NVIDIA/gpu-monitoring-tools v0.0.0-20211102125545-5a2c58442e48
 	github.com/containerd/nri v0.5.0
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/golang/glog v1.2.5
